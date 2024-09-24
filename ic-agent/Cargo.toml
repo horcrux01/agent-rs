@@ -14,6 +14,11 @@ categories = ["api-bindings", "data-structures", "no-std"]
 keywords = ["internet-computer", "agent", "icp", "dfinity"]
 include = ["src", "Cargo.toml", "../LICENSE", "README.md"]
 
+[lib]
+name = "ic_agent"
+crate-type = ["cdylib"]
+
+
 [dependencies]
 arc-swap = { version = "1.7", optional = true }
 async-channel = { version = "1.9", optional = true }
@@ -50,6 +55,9 @@ thiserror = { workspace = true }
 time = { workspace = true }
 tracing = { version = "0.1", optional = true }
 url = "2.1.0"
+pyo3 = {version = "0.22.2", features = ["extension-module", "experimental-async"] }
+tokio = { version = "1.39.3", features = ["full"] }
+num-traits = "0.2.19"
 
 [dependencies.reqwest]
 workspace = true
