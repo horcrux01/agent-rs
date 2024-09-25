@@ -144,8 +144,8 @@ type AgentFuture<'a, V> = Pin<Box<dyn Future<Output = Result<V, AgentError>> + '
 /// This agent does not understand Candid, and only acts on byte buffers.
 #[derive(Clone)]
 pub struct Agent {
-    nonce_factory: Arc<dyn NonceGenerator>,
-    identity: Arc<dyn Identity>,
+    pub nonce_factory: Arc<dyn NonceGenerator>,
+    pub identity: Arc<dyn Identity>,
     ingress_expiry: Duration,
     root_key: Arc<RwLock<Vec<u8>>>,
     client: Client,

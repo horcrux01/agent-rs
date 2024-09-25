@@ -113,6 +113,7 @@ pub mod export;
 pub mod identity;
 mod util;
 
+use agent::response_authentication;
 use agent::response_authentication::LookupPath;
 #[doc(inline)]
 pub use agent::{agent_error, agent_error::AgentError, Agent, NonceFactory, NonceGenerator};
@@ -175,7 +176,7 @@ pub fn get_icrc_balance() -> PyResult<u64> {
         };
 
         let encoded_account_balance_query = Encode!(&account_balance_args).unwrap();
-        let response = agent.query(&icp_ledger, "icrc1_balance_of")
+        let response = agent.update(&icp_ledger, "icrc1_balance_of")
             .with_arg(encoded_account_balance_query).await.unwrap();
 
         let tokens = Decode!(&response, Nat).unwrap();
