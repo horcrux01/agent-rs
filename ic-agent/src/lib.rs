@@ -176,7 +176,7 @@ pub fn get_icrc_balance() -> PyResult<u64> {
         };
 
         let encoded_account_balance_query = Encode!(&account_balance_args).unwrap();
-        let response = agent.update(&icp_ledger, "icrc1_balance_of")
+        let response = agent.query(&icp_ledger, "icrc1_balance_of")
             .with_arg(encoded_account_balance_query).await.unwrap();
 
         let tokens = Decode!(&response, Nat).unwrap();
