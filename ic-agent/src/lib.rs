@@ -126,17 +126,6 @@ pub use identity::{Identity, Signature};
 pub use ic_certification::{hash_tree, Certificate};
 
 
-
-use pyo3::prelude::*;
-
-use candid::{Encode, Decode, CandidType, Nat};
-use pyo3::exceptions::PyRuntimeError;
-use serde::Deserialize;
-use tokio::runtime::Runtime;
-use crate::export::Principal;
-use crate::identity::AnonymousIdentity;
-use num_traits::cast::ToPrimitive;
-
 /// Looks up a value in the certificate's tree at the specified hash.
 ///
 /// Returns the value if it was found; otherwise, errors with `LookupPathAbsent`, `LookupPathUnknown`, or `LookupPathError`.
@@ -147,52 +136,3 @@ pub fn lookup_value<P: LookupPath, Storage: AsRef<[u8]>>(
     agent::response_authentication::lookup_value(&tree.tree, path)
 }
 
-
-#[derive(CandidType)]
-struct AccountBalanceArgs {
-    owner: Principal,
-}
-
-impl From<AgentError> for PyErr {
-    fn from(err: AgentError) -> PyErr {
-        PyRuntimeError::new_err(format!("AgentError: {:?}", err))
-    }
-}
-
-#[pyfunction]
-pub fn get_icrc_balance() -> PyResult<u64> {
-    let rt = Runtime::new().unwrap();
-
-    let result: Result<u64, PyErr> = rt.block_on(async {
-        let icp_ledger = Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap();
-        let url = "https://ic0.app/";
-        let agent = Agent::builder()
-            .with_url(url)
-            .with_identity(AnonymousIdentity)
-            .build()?;
-
-        let account_balance_args = AccountBalanceArgs {
-            owner: Principal::from_text("jjdqv-lkiyk-tg6vt-26w6h-nn37k-cpzu4-hmogp-hkj3s-ll5oc-gfhgs-fae").unwrap(),
-        };
-
-        let encoded_account_balance_query = Encode!(&account_balance_args).unwrap();
-        let response = agent.query(&icp_ledger, "icrc1_balance_of")
-            .with_arg(encoded_account_balance_query).await.unwrap();
-
-        let tokens = Decode!(&response, Nat).unwrap();
-        Ok(tokens.0.to_u64().unwrap())
-    });
-
-    match result {
-        Ok(balance) => Ok(balance),
-        Err(err) => Err(PyRuntimeError::new_err(err.to_string())),
-    }
-}
-
-
-#[pymodule]
-fn ic_agent(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(get_icrc_balance, m)?)?;
-
-    Ok(())
-}
