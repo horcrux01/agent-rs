@@ -113,6 +113,7 @@ pub mod export;
 pub mod identity;
 mod util;
 
+use agent::response_authentication;
 use agent::response_authentication::LookupPath;
 #[doc(inline)]
 pub use agent::{agent_error, agent_error::AgentError, Agent, NonceFactory, NonceGenerator};
