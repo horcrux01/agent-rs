@@ -15,6 +15,7 @@ pub use agent_config::AgentConfig;
 pub use agent_error::AgentError;
 use agent_error::HttpErrorPayload;
 use async_lock::Semaphore;
+use async_trait::async_trait;
 pub use builder::AgentBuilder;
 use cached::{Cached, TimedCache};
 use ed25519_consensus::{Error as Ed25519Error, Signature, VerificationKey};
@@ -27,9 +28,10 @@ pub use ic_transport_types::{
 };
 pub use nonce::{NonceFactory, NonceGenerator};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet, StepFns};
-use reqwest::{Body, Client, Request};
+use reqwest::{Body, Client, Request, Response};
 use route_provider::RouteProvider;
 use time::OffsetDateTime;
+use tower_service::Service;
 
 #[cfg(test)]
 mod agent_test;
@@ -148,12 +150,13 @@ pub struct Agent {
     pub identity: Arc<dyn Identity>,
     ingress_expiry: Duration,
     root_key: Arc<RwLock<Vec<u8>>>,
-    client: Client,
+    client: Arc<dyn HttpService>,
     route_provider: Arc<dyn RouteProvider>,
     subnet_key_cache: Arc<Mutex<SubnetCache>>,
     concurrent_requests_semaphore: Arc<Semaphore>,
     verify_query_signatures: bool,
     max_response_body_size: Option<usize>,
+    max_polling_time: Duration,
     #[allow(dead_code)]
     max_tcp_error_retries: usize,
 }
@@ -180,19 +183,23 @@ impl Agent {
             identity: config.identity,
             ingress_expiry: config.ingress_expiry.unwrap_or(DEFAULT_INGRESS_EXPIRY),
             root_key: Arc::new(RwLock::new(IC_ROOT_KEY.to_vec())),
-            client: config.client.unwrap_or_else(|| {
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    Client::builder()
-                        .use_rustls_tls()
-                        .timeout(Duration::from_secs(360))
-                        .build()
-                        .expect("Could not create HTTP client.")
-                }
-                #[cfg(all(target_family = "wasm", feature = "wasm-bindgen"))]
-                {
-                    Client::new()
-                }
+            client: config.http_service.unwrap_or_else(|| {
+                Arc::new(Retry429Logic {
+                    client: config.client.unwrap_or_else(|| {
+                        #[cfg(not(target_family = "wasm"))]
+                        {
+                            Client::builder()
+                                .use_rustls_tls()
+                                .timeout(Duration::from_secs(360))
+                                .build()
+                                .expect("Could not create HTTP client.")
+                        }
+                        #[cfg(all(target_family = "wasm", feature = "wasm-bindgen"))]
+                        {
+                            Client::new()
+                        }
+                    }),
+                })
             }),
             route_provider: config
                 .route_provider
@@ -202,6 +209,7 @@ impl Agent {
             concurrent_requests_semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
             max_response_body_size: config.max_response_body_size,
             max_tcp_error_retries: config.max_tcp_error_retries,
+            max_polling_time: config.max_polling_time,
         })
     }
 
@@ -609,12 +617,12 @@ impl Agent {
         })
     }
 
-    fn get_retry_policy() -> ExponentialBackoff<SystemClock> {
+    fn get_retry_policy(&self) -> ExponentialBackoff<SystemClock> {
         ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_millis(500))
             .with_max_interval(Duration::from_secs(1))
             .with_multiplier(1.4)
-            .with_max_elapsed_time(Some(Duration::from_secs(60 * 5)))
+            .with_max_elapsed_time(Some(self.max_polling_time))
             .build()
     }
 
@@ -625,7 +633,7 @@ impl Agent {
         effective_canister_id: Principal,
         signed_request_status: Vec<u8>,
     ) -> Result<Vec<u8>, AgentError> {
-        let mut retry_policy = Self::get_retry_policy();
+        let mut retry_policy = self.get_retry_policy();
 
         let mut request_accepted = false;
         loop {
@@ -673,7 +681,7 @@ impl Agent {
         request_id: &RequestId,
         effective_canister_id: Principal,
     ) -> Result<Vec<u8>, AgentError> {
-        let mut retry_policy = Self::get_retry_policy();
+        let mut retry_policy = self.get_retry_policy();
 
         let mut request_accepted = false;
         loop {
@@ -1110,40 +1118,13 @@ impl Agent {
             Ok(http_request)
         };
 
-        // Dispatch request with a retry logic only for non-wasm builds.
-        let response = {
-            #[cfg(target_family = "wasm")]
-            {
-                let http_request = create_request_with_generated_url()?;
-                self.client.execute(http_request).await?
-            }
-            #[cfg(not(target_family = "wasm"))]
-            {
-                // RouteProvider generates urls dynamically. Some of these urls can be potentially unhealthy.
-                // TCP related errors (host unreachable, connection refused, connection timed out, connection reset) can be safely retried with a newly generated url.
-
-                let mut retry_count = 0;
-
-                loop {
-                    let http_request = create_request_with_generated_url()?;
-
-                    match self.client.execute(http_request).await {
-                        Ok(response) => break response,
-                        Err(err) => {
-                            // Network-related errors can be retried.
-                            if err.is_connect() {
-                                if retry_count >= self.max_tcp_error_retries {
-                                    return Err(AgentError::TransportError(err));
-                                }
-                                retry_count += 1;
-                                continue;
-                            }
-                            return Err(AgentError::TransportError(err));
-                        }
-                    }
-                }
-            }
-        };
+        let response = self
+            .client
+            .call(
+                &create_request_with_generated_url,
+                self.max_tcp_error_retries,
+            )
+            .await?;
 
         let http_status = response.status();
         let response_headers = response.headers().clone();
@@ -1184,15 +1165,10 @@ impl Agent {
         endpoint: &str,
         body: Option<Vec<u8>>,
     ) -> Result<(StatusCode, Vec<u8>), AgentError> {
-        let request_result = loop {
-            let result = self
-                .request(method.clone(), endpoint, body.as_ref().cloned())
-                .await?;
-            if result.0 != StatusCode::TOO_MANY_REQUESTS {
-                break result;
-            }
-            crate::util::sleep(Duration::from_millis(250)).await;
-        };
+        let request_result = self
+            .request(method.clone(), endpoint, body.as_ref().cloned())
+            .await?;
+
         let status = request_result.0;
         let headers = request_result.1;
         let body = request_result.2;
@@ -1535,7 +1511,7 @@ pub struct ApiBoundaryNode {
     pub ipv4_address: Option<String>,
 }
 
-/// A Query Request Builder.
+/// A query request builder.
 ///
 /// This makes it easier to do query calls without actually passing all arguments.
 #[derive(Debug, Clone)]
@@ -1659,14 +1635,10 @@ impl<'agent> QueryBuilder<'agent> {
     /// Sign a query call. This will return a [`signed::SignedQuery`]
     /// which contains all fields of the query and the signed query in CBOR encoding
     pub fn sign(self) -> Result<SignedQuery, AgentError> {
-        let content = self.agent.query_content(
-            self.canister_id,
-            self.method_name,
-            self.arg,
-            self.ingress_expiry_datetime,
-            self.use_nonce,
-        )?;
-        let signed_query = sign_envelope(&content, self.agent.identity.clone())?;
+        let effective_canister_id = self.effective_canister_id;
+        let identity = self.agent.identity.clone();
+        let content = self.into_envelope()?;
+        let signed_query = sign_envelope(&content, identity)?;
         let EnvelopeContent::Query {
             ingress_expiry,
             sender,
@@ -1684,10 +1656,21 @@ impl<'agent> QueryBuilder<'agent> {
             canister_id,
             method_name,
             arg,
-            effective_canister_id: self.effective_canister_id,
+            effective_canister_id,
             signed_query,
             nonce,
         })
+    }
+
+    /// Converts the query builder into [`EnvelopeContent`] for external signing or storage.
+    pub fn into_envelope(self) -> Result<EnvelopeContent, AgentError> {
+        self.agent.query_content(
+            self.canister_id,
+            self.method_name,
+            self.arg,
+            self.ingress_expiry_datetime,
+            self.use_nonce,
+        )
     }
 }
 
@@ -1735,7 +1718,7 @@ impl<'a> UpdateCall<'a> {
         }
     }
 }
-/// An Update Request Builder.
+/// An update request Builder.
 ///
 /// This makes it easier to do update calls without actually passing all arguments or specifying
 /// if you want to wait or not.
@@ -1825,15 +1808,10 @@ impl<'agent> UpdateBuilder<'agent> {
     /// Sign a update call. This will return a [`signed::SignedUpdate`]
     /// which contains all fields of the update and the signed update in CBOR encoding
     pub fn sign(self) -> Result<SignedUpdate, AgentError> {
-        let nonce = self.agent.nonce_factory.generate();
-        let content = self.agent.update_content(
-            self.canister_id,
-            self.method_name,
-            self.arg,
-            self.ingress_expiry_datetime,
-            nonce,
-        )?;
-        let signed_update = sign_envelope(&content, self.agent.identity.clone())?;
+        let identity = self.agent.identity.clone();
+        let effective_canister_id = self.effective_canister_id;
+        let content = self.into_envelope()?;
+        let signed_update = sign_envelope(&content, identity)?;
         let request_id = to_request_id(&content)?;
         let EnvelopeContent::Call {
             nonce,
@@ -1853,10 +1831,22 @@ impl<'agent> UpdateBuilder<'agent> {
             canister_id,
             method_name,
             arg,
-            effective_canister_id: self.effective_canister_id,
+            effective_canister_id,
             signed_update,
             request_id,
         })
+    }
+
+    /// Converts the update builder into an [`EnvelopeContent`] for external signing or storage.
+    pub fn into_envelope(self) -> Result<EnvelopeContent, AgentError> {
+        let nonce = self.agent.nonce_factory.generate();
+        self.agent.update_content(
+            self.canister_id,
+            self.method_name,
+            self.arg,
+            self.ingress_expiry_datetime,
+            nonce,
+        )
     }
 }
 
@@ -1865,6 +1855,100 @@ impl<'agent> IntoFuture for UpdateBuilder<'agent> {
     type Output = Result<Vec<u8>, AgentError>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.call_and_wait())
+    }
+}
+
+/// HTTP client middleware. Implemented automatically for `reqwest`-compatible by-ref `tower::Service`, such as `reqwest_middleware`.
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+pub trait HttpService: Send + Sync {
+    /// Perform a HTTP request. Any retry logic should call `req` again, instead of `Request::try_clone`.
+    async fn call<'a>(
+        &'a self,
+        req: &'a (dyn Fn() -> Result<Request, AgentError> + Send + Sync),
+        max_retries: usize,
+    ) -> Result<Response, AgentError>;
+}
+#[cfg(not(target_family = "wasm"))]
+#[async_trait]
+impl<T> HttpService for T
+where
+    for<'a> &'a T: Service<Request, Response = Response, Error = reqwest::Error>,
+    for<'a> <&'a Self as Service<Request>>::Future: Send,
+    T: Send + Sync + ?Sized,
+{
+    #[allow(clippy::needless_arbitrary_self_type)]
+    async fn call<'a>(
+        mut self: &'a Self,
+        req: &'a (dyn Fn() -> Result<Request, AgentError> + Send + Sync),
+        max_retries: usize,
+    ) -> Result<Response, AgentError> {
+        let mut retry_count = 0;
+        loop {
+            match Service::call(&mut self, req()?).await {
+                Err(err) => {
+                    // Network-related errors can be retried.
+                    if err.is_connect() {
+                        if retry_count >= max_retries {
+                            return Err(AgentError::TransportError(err));
+                        }
+                        retry_count += 1;
+                    }
+                }
+                Ok(resp) => return Ok(resp),
+            }
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[async_trait(?Send)]
+impl<T> HttpService for T
+where
+    for<'a> &'a T: Service<Request, Response = Response, Error = reqwest::Error>,
+    T: Send + Sync + ?Sized,
+{
+    #[allow(clippy::needless_arbitrary_self_type)]
+    async fn call<'a>(
+        mut self: &'a Self,
+        req: &'a (dyn Fn() -> Result<Request, AgentError> + Send + Sync),
+        _: usize,
+    ) -> Result<Response, AgentError> {
+        Ok(Service::call(&mut self, req()?).await?)
+    }
+}
+
+struct Retry429Logic {
+    client: Client,
+}
+
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+impl HttpService for Retry429Logic {
+    async fn call<'a>(
+        &'a self,
+        req: &'a (dyn Fn() -> Result<Request, AgentError> + Send + Sync),
+        _max_tcp_retries: usize,
+    ) -> Result<Response, AgentError> {
+        let mut retries = 0;
+        loop {
+            #[cfg(not(target_family = "wasm"))]
+            let resp = self.client.call(req, _max_tcp_retries).await?;
+            // Client inconveniently does not implement Service on wasm
+            #[cfg(target_family = "wasm")]
+            let resp = self.client.execute(req()?).await?;
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                if retries == 6 {
+                    break Ok(resp);
+                } else {
+                    retries += 1;
+                    crate::util::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            } else {
+                break Ok(resp);
+            }
+        }
     }
 }
 
