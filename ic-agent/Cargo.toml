@@ -56,7 +56,7 @@ time = { workspace = true }
 tower-service = "0.3"
 tracing = { version = "0.1", optional = true }
 url = "2.1.0"
-pyo3 = {version = "0.22.2", features = ["extension-module", "experimental-async"] }
+pyo3 = {version = "0.22.4", features = ["extension-module", "experimental-async"] }
 tokio = { version = "1.39.3", features = ["full"] }
 num-traits = "0.2.19"
 
