@@ -567,7 +567,7 @@ impl Agent {
         &self,
         effective_canister_id: Principal,
         signed_update: Vec<u8>,
-    ) -> Result<CallResponse<Vec<u8>>, AgentError> {
+    ) -> Result<CallResponse<(Vec<u8>, Certificate)>, AgentError> {
         let envelope: Envelope =
             serde_cbor::from_slice(&signed_update).map_err(AgentError::InvalidCborData)?;
         let request_id = to_request_id(&envelope.content)?;
@@ -585,7 +585,9 @@ impl Agent {
                 let status = lookup_request_status(&certificate, &request_id)?;
 
                 match status {
-                    RequestStatusResponse::Replied(reply) => Ok(CallResponse::Response(reply.arg)),
+                    RequestStatusResponse::Replied(reply) => {
+                        Ok(CallResponse::Response((reply.arg, certificate)))
+                    }
                     RequestStatusResponse::Rejected(reject_response) => {
                         Err(AgentError::CertifiedReject(reject_response))?
                     }
